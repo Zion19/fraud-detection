@@ -245,17 +245,6 @@ def plot_feature_importance(model, feature_names, top_n=10, save_path=None):
 
 
 def shap_explainability(model, X_test, y_test, feature_names, save_dir=None, sample_size=1000):
-    """
-    Generate SHAP plots and display them directly in the notebook.
-    
-    Parameters:
-        model: Trained model (e.g., XGBoost, RandomForest, etc.).
-        X_test: Test dataset (features).
-        y_test: True labels for the test dataset.
-        feature_names: List of feature names.
-        save_dir: Directory to save generated SHAP plots (default: None).
-        sample_size: Number of samples to use for SHAP analysis (default: 1000).
-    """
     # Sample a subset of the test set for SHAP analysis
     sample_idx = np.random.RandomState(42).choice(X_test.shape[0], min(sample_size, X_test.shape[0]), replace=False)
     X_sample = X_test.iloc[sample_idx]
