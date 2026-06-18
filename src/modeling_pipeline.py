@@ -4,7 +4,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
+import shap
+import matplotlib.pyplot as plt
 from sklearn.base import clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -221,65 +222,159 @@ def tune_xgboost(X, y, random_state=42):
     return best_params
 
 
+def plot_feature_importance(model, feature_names, top_n=10, save_path=None):
+    if hasattr(model, 'feature_importances_'):
+        importance = model.feature_importances_
+    elif hasattr(model, 'coef_'):
+        importance = np.abs(model.coef_).flatten()
+    else:
+        raise ValueError('Model does not expose feature importances.')
+
+    importance = pd.Series(importance, index=feature_names).sort_values(ascending=False).head(top_n)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    importance.plot.barh(ax=ax, color='#3182bd')
+    ax.invert_yaxis()
+    ax.set_title('Top Feature Importances')
+    ax.set_xlabel('Importance')
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f'Saved feature importance plot to {save_path}')
+    plt.close(fig)
+    return importance
+
+
+def shap_explainability(model, X_test, y_test, feature_names, save_dir=None, sample_size=1000):
+    """
+    Generate SHAP plots and display them directly in the notebook.
+    
+    Parameters:
+        model: Trained model (e.g., XGBoost, RandomForest, etc.).
+        X_test: Test dataset (features).
+        y_test: True labels for the test dataset.
+        feature_names: List of feature names.
+        save_dir: Directory to save generated SHAP plots (default: None).
+        sample_size: Number of samples to use for SHAP analysis (default: 1000).
+    """
+    # Sample a subset of the test set for SHAP analysis
+    sample_idx = np.random.RandomState(42).choice(X_test.shape[0], min(sample_size, X_test.shape[0]), replace=False)
+    X_sample = X_test.iloc[sample_idx]
+
+    # Create SHAP explainer and compute SHAP values
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_sample)
+
+    # Generate and display the SHAP summary plot
+    plt.figure(figsize=(10, 8))
+    shap.summary_plot(shap_values, X_sample, feature_names=feature_names, show=False)
+    plt.tight_layout()
+    if save_dir:
+        save_dir_path = Path(save_dir)
+        save_dir_path.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_dir_path / 'shap_summary_plot.png', dpi=150, bbox_inches='tight')
+    plt.show()  # Ensure plot is displayed in the notebook
+
+    # Identify one true positive, false positive, and false negative using the full test set
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+    cm = confusion_matrix(y_test, y_pred)
+
+    # Find indices for true positive, false positive, and false negative
+    indices = {
+        'true_positive': np.where((y_test == 1) & (y_pred == 1))[0],
+        'false_positive': np.where((y_test == 0) & (y_pred == 1))[0],
+        'false_negative': np.where((y_test == 1) & (y_pred == 0))[0],
+    }
+
+    selected = {}
+    for label, idx_array in indices.items():
+        if len(idx_array) > 0:
+            selected[label] = idx_array[0]
+
+    # Generate and display SHAP force plots for selected instances
+    for label, idx in selected.items():
+        instance = X_test.iloc[[idx]]
+        if idx in sample_idx:
+            instance_shap_values = shap_values[np.where(sample_idx == idx)[0][0]]
+        else:
+            instance_shap_values = explainer.shap_values(instance)[0]
+
+        # Display the force plot directly in the notebook
+        shap.force_plot(
+            explainer.expected_value,
+            instance_shap_values,
+            instance,
+            feature_names=feature_names,
+            matplotlib=True,
+            show=False
+        )
+        plt.tight_layout()
+        if save_dir:
+            save_dir_path = Path(save_dir)
+            save_dir_path.mkdir(parents=True, exist_ok=True)
+            plt.savefig(save_dir_path / f'shap_force_plot_{label}.png', dpi=150, bbox_inches='tight')
+        plt.show()
+
+    return {
+        'feature_names': feature_names,
+        'shap_values': shap_values,
+        'selected_instances': selected,
+        'confusion_matrix': cm,
+    }
+
 def run_pipeline():
     results = []
+    output_dir = ROOT_DIR / 'models' / 'reports'
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    datasets = [
-        ("CreditCard", prepare_creditcard_dataset),
-        ("FraudData", prepare_fraud_dataset),
+    dataset_configs = [
+        ('CreditCard', prepare_creditcard_dataset),
+        ('FraudData', prepare_fraud_dataset),
     ]
 
-    for name, fn in datasets:
-        X, y = fn("data/processed")
-        describe_dataset(name, X, y)
+    for dataset_name, prepare_fn in dataset_configs:
+        X, y = prepare_fn('data/processed')
+        describe_dataset(dataset_name, X, y)
 
-        X_train_s, X_test_s, y_train, y_test, X_res, y_res, scaler = (
-            split_scale_resample(X, y)
-        )
+        X_train_scaled, X_test_scaled, y_train, y_test, X_train_res, y_train_res, scaler = split_scale_resample(X, y)
 
-        baseline = LogisticRegression(
-            max_iter=1000,
-            class_weight="balanced",
-            random_state=42,
-        )
+        baseline = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42)
+        baseline.fit(X_train_res, y_train_res)
+        results.append(evaluate_model(baseline, X_test_scaled, y_test, 'LogisticRegression', dataset_name))
 
-        baseline.fit(X_res, y_res)
-
-        results.append(
-            evaluate_model(
-                baseline,
-                X_test_s,
-                y_test,
-                "LogReg",
-                name,
-            )
-        )
-
+        # Tune XGBoost on the full dataset and then fit the best ensemble on the train split.
         best_params = tune_xgboost(X, y)
-
-        model = XGBClassifier(
+        ensemble = XGBClassifier(
             use_label_encoder=False,
-            eval_metric="logloss",
+            eval_metric='logloss',
             n_jobs=-1,
             random_state=42,
-            **best_params,
+            **best_params, # type: ignore
         )
+        ensemble.fit(X_train_res, y_train_res)
+        results.append(evaluate_model(ensemble, X_test_scaled, y_test, 'XGBoost', dataset_name))
 
-        model.fit(X_res, y_res)
+        # Save feature importance for the chosen model
+        feature_names = X.columns.tolist()
+        importance = plot_feature_importance(ensemble, feature_names, save_path=output_dir / f'{dataset_name}_feature_importance.png')
+        importance.to_csv(output_dir / f'{dataset_name}_feature_importance.csv')
 
-        results.append(
-            evaluate_model(
-                model,
-                X_test_s,
-                y_test,
-                "XGBoost",
-                name,
-            )
-        )
+        # Save the best model to disk for later explainability if it's the fraud dataset.
+        if dataset_name == 'FraudData':
+            import joblib
+            joblib.dump(ensemble, ROOT_DIR / 'models' / 'best_fraud_xgb.joblib')
+            print('Saved FraudData ensemble model artifact.')
+
+            shap_dir = ROOT_DIR / 'models' / 'shap_fraud'
+            X_test_df = pd.DataFrame(X_test_scaled, columns=feature_names)
+            shap_explainability(ensemble, X_test_df, y_test.reset_index(drop=True), feature_names, shap_dir)
 
     summary_df = pd.DataFrame(results)
+    summary_path = output_dir / 'model_comparison_summary.csv'
+    summary_df.to_csv(summary_path, index=False)
+    print(f'Saved model comparison summary to {summary_path}')
     print(summary_df)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     run_pipeline()
